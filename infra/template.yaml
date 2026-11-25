@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  How Data Moves on AWS (SCD PPSU 2026). One stack for the whole demo:
+  S3 bucket with sample data, Glue database, crawler and ETL job, Athena workgroup
+  and saved queries. Delete the stack and everything goes away, data included.
+
+Parameters:
+  SourceRepoRawUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/nirmalpatel008/how-data-moves-on-aws/main
+    Description: Public raw URL of the repo. Sample data and the Glue script are copied from here.
+
+Resources:
+  # ---------------- 1. STORE: S3 bucket ----------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub how-data-moves-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Copies sample CSVs + Glue script in on create, empties the bucket on delete
+  BucketHelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DemoBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub ${DataBucket.Arn}/*
+
+  BucketHelperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Loads demo files into the bucket on create, empties it on delete
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt BucketHelperRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, cfnresponse, urllib.request
+          s3 = boto3.resource("s3")
+          FILES = ["glue/clean_orders_job.py"] + [
+              f"data/raw/orders/orders_2026-11-{d}.csv" for d in range(16, 21)]
+          def target(path):
+              if path.startswith("glue/"):
+                  return "scripts/" + path.split("/")[-1]
+              return path.replace("data/raw/", "raw/")
+          def handler(event, context):
+              props = event["ResourceProperties"]
+              bucket = s3.Bucket(props["Bucket"])
+              try:
+                  if event["RequestType"] == "Delete":
+                      bucket.objects.all().delete()
+                  elif event["RequestType"] == "Create":
+                      base = props["SourceUrl"].rstrip("/")
+                      for f in FILES:
+                          body = urllib.request.urlopen(f"{base}/{f}", timeout=30).read()
+                          bucket.put_object(Key=target(f), Body=body)
+                          print("copied", f)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print("error:", e)
+                  # never block a stack delete
+                  status = cfnresponse.SUCCESS if event["RequestType"] == "Delete" else cfnresponse.FAILED
+                  cfnresponse.send(event, context, status, {}, reason=str(e)[:200])
+
+  DemoFiles:
+    Type: Custom::DemoFiles
+    Properties:
+      ServiceToken: !GetAtt BucketHelperFunction.Arn
+      Bucket: !Ref DataBucket
+      SourceUrl: !Ref SourceRepoRawUrl
+
+  # ---------------- 2. CLEAN: Glue ----------------
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub GlueDemoRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DemoBucketAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub ${DataBucket.Arn}/*
+
+  CanteenDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: canteen_db
+        Description: Campus canteen orders (How Data Moves on AWS demo)
+
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: DemoFiles
+    Properties:
+      Name: canteen-raw-crawler
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref CanteenDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${DataBucket}/raw/orders/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  CleanOrdersJob:
+    Type: AWS::Glue::Job
+    DependsOn: DemoFiles
+    Properties:
+      Name: clean-canteen-orders
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 15
+      MaxRetries: 0
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub s3://${DataBucket}/scripts/clean_orders_job.py
+      DefaultArguments:
+        --DATABASE: canteen_db
+        --SOURCE_TABLE: orders
+        --TARGET_PATH: !Sub s3://${DataBucket}/processed/orders_clean/
+        --TARGET_TABLE: orders_clean
+        --TempDir: !Sub s3://${DataBucket}/temp/
+        --job-language: python
+
+  # ---------------- 3. ASK: Athena ----------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: how-data-moves
+      Description: Workgroup for the How Data Moves on AWS demo
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${DataBucket}/athena-results/
+
+  QueryMess:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "A3 - Spot the mess (raw CSV)"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT item, COUNT(*) AS times_seen
+        FROM orders
+        GROUP BY item
+        ORDER BY lower(trim(item)), item;
+
+  QueryTopItems:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "B2 - What sells the most"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT item, SUM(quantity) AS sold
+        FROM orders_clean
+        GROUP BY item
+        ORDER BY sold DESC
+        LIMIT 5;
+
+  QueryRevenue:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "B3 - What makes the most money"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT item, SUM(total_amount) AS revenue_inr
+        FROM orders_clean
+        GROUP BY item
+        ORDER BY revenue_inr DESC
+        LIMIT 5;
+
+  QueryPayments:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "B4 - UPI vs cash"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT payment_mode, COUNT(*) AS orders,
+               ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS percent
+        FROM orders_clean
+        GROUP BY payment_mode
+        ORDER BY orders DESC;
+
+  QueryRushHour:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "B5 - Rush hour"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT order_hour, COUNT(*) AS orders
+        FROM orders_clean
+        GROUP BY order_hour
+        ORDER BY orders DESC;
+
+  QueryCsvScan:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "C1 - Revenue from CSV (check Data scanned)"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: SELECT SUM(quantity * unit_price) AS revenue FROM orders;
+
+  QueryParquetScan:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "C2 - Revenue from Parquet (check Data scanned)"
+      Database: canteen_db
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: SELECT SUM(total_amount) AS revenue FROM orders_clean;
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  CrawlerName:
+    Value: !Ref RawCrawler
+  GlueJobName:
+    Value: !Ref CleanOrdersJob
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+  GlueDatabase:
+    Value: !Ref CanteenDatabase

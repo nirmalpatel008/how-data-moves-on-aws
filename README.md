@@ -34,6 +34,8 @@ We'll store the data in S3, clean it with Glue, and ask questions with Athena. N
 ## What's in this repo
 
 ```
+infra/template.yaml           ONE CloudFormation stack: bucket + data, Glue, Athena, saved queries
+demo.sh                       guided demo runner: up, run, down
 data/generate_orders.py       makes fake canteen orders (already generated for you)
 data/raw/orders/*.csv         5 days of messy orders (2,950 rows)
 glue/clean_orders_job.py      the Glue ETL job (PySpark)
@@ -49,6 +51,39 @@ images/                       architecture diagrams
 - Use the **Mumbai (ap-south-1)** region (top right of the console). Any region works, just stay in one.
 - Expected cost: a few cents. The crawler is billed for at least 10 minutes per run and the Glue job for at least 1 minute, at about $0.44 per DPU-hour. Athena charges by data scanned, and our data is tiny. Run the cleanup script at the end.
 - If you're on the AWS Free plan and a service says it isn't available, the console will tell you. You can switch to the Paid plan and your credits still apply.
+
+## Quick path: one stack, one script (what the live demo uses)
+
+Everything (S3 bucket with the sample data, IAM roles, Glue database, crawler, ETL job, Athena workgroup and saved queries) comes from **one CloudFormation stack**. Deleting the stack removes all of it, files included.
+
+In **CloudShell**:
+
+```bash
+git clone https://github.com/nirmalpatel008/how-data-moves-on-aws.git
+cd how-data-moves-on-aws
+./demo.sh up      # create the stack (about 2 minutes)
+./demo.sh run     # guided demo: press Enter to move through each step
+./demo.sh down    # delete everything
+```
+
+`./demo.sh run` walks through 6 steps, the same ones on the demo slide:
+
+1. Raw CSV files sitting in S3
+2. Crawler creates the `orders` table
+3. Athena shows us the mess (56 spellings for 14 items)
+4. Glue job cleans it into Parquet
+5. Athena answers the 4 questions
+6. CSV vs Parquet: data scanned
+
+Tips: `AUTO=1 ./demo.sh run` runs without pausing, `FAST=1` skips the typing effect. Prefer the console? After `./demo.sh up`, open Glue and Athena: the crawler, job and tables are there, and the queries are under **Athena > Saved queries** (pick the workgroup `how-data-moves` first).
+
+> The stack copies the sample data from this GitHub repo, so the repo must be public. If you already ran `scripts/setup.sh`, run `scripts/cleanup.sh` first, because both use the same bucket name.
+
+You can also create the stack from the console: **CloudFormation > Create stack > Upload a template file** and pick `infra/template.yaml` (tick the IAM acknowledgement).
+
+---
+
+The steps below are the **manual console path**, if you want to click through and build each piece yourself.
 
 ## Step 1: Setup (2 minutes, in CloudShell)
 
