@@ -15,7 +15,7 @@ Resources:
   DataBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub how-data-moves-${AWS::AccountId}-${AWS::Region}
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -60,7 +60,7 @@ Resources:
       Role: !GetAtt BucketHelperRole.Arn
       Code:
         ZipFile: |
-          import boto3, cfnresponse, urllib.request
+          import json, urllib.request, boto3
           s3 = boto3.resource("s3")
           FILES = ["glue/clean_orders_job.py"] + [
               f"data/raw/orders/orders_2026-11-{d}.csv" for d in range(16, 21)]
@@ -68,29 +68,38 @@ Resources:
               if path.startswith("glue/"):
                   return "scripts/" + path.split("/")[-1]
               return path.replace("data/raw/", "raw/")
+          def respond(event, status, reason):
+              body = json.dumps({
+                  "Status": status, "Reason": reason[:200],
+                  "PhysicalResourceId": "demo-files-" + event["ResourceProperties"]["Bucket"],
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {}}).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              urllib.request.urlopen(req, timeout=30)
           def handler(event, context):
-              props = event["ResourceProperties"]
-              bucket = s3.Bucket(props["Bucket"])
+              print(json.dumps({k: event.get(k) for k in ("RequestType", "LogicalResourceId")}))
               try:
+                  bucket = s3.Bucket(event["ResourceProperties"]["Bucket"])
                   if event["RequestType"] == "Delete":
                       bucket.objects.all().delete()
                   elif event["RequestType"] == "Create":
-                      base = props["SourceUrl"].rstrip("/")
+                      base = event["ResourceProperties"]["SourceUrl"].rstrip("/")
                       for f in FILES:
                           body = urllib.request.urlopen(f"{base}/{f}", timeout=30).read()
                           bucket.put_object(Key=target(f), Body=body)
                           print("copied", f)
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  respond(event, "SUCCESS", "ok")
               except Exception as e:
                   print("error:", e)
                   # never block a stack delete
-                  status = cfnresponse.SUCCESS if event["RequestType"] == "Delete" else cfnresponse.FAILED
-                  cfnresponse.send(event, context, status, {}, reason=str(e)[:200])
+                  respond(event, "SUCCESS" if event["RequestType"] == "Delete" else "FAILED", str(e))
 
   DemoFiles:
     Type: Custom::DemoFiles
     Properties:
       ServiceToken: !GetAtt BucketHelperFunction.Arn
+      ServiceTimeout: "300"
       Bucket: !Ref DataBucket
       SourceUrl: !Ref SourceRepoRawUrl
 
@@ -98,7 +107,7 @@ Resources:
   GlueRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub GlueDemoRole-${AWS::Region}
+      RoleName: !Sub ${AWS::StackName}-glue-${AWS::Region}
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -123,14 +132,14 @@ Resources:
     Properties:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
-        Name: canteen_db
+        Name: !Join ["_", [!Join ["_", !Split ["-", !Ref "AWS::StackName"]], "db"]]
         Description: Campus canteen orders (How Data Moves on AWS demo)
 
   RawCrawler:
     Type: AWS::Glue::Crawler
     DependsOn: DemoFiles
     Properties:
-      Name: canteen-raw-crawler
+      Name: !Sub ${AWS::StackName}-raw-crawler
       Role: !GetAtt GlueRole.Arn
       DatabaseName: !Ref CanteenDatabase
       Targets:
@@ -144,7 +153,7 @@ Resources:
     Type: AWS::Glue::Job
     DependsOn: DemoFiles
     Properties:
-      Name: clean-canteen-orders
+      Name: !Sub ${AWS::StackName}-clean-orders
       Role: !GetAtt GlueRole.Arn
       GlueVersion: "5.0"
       WorkerType: G.1X
@@ -156,7 +165,7 @@ Resources:
         PythonVersion: "3"
         ScriptLocation: !Sub s3://${DataBucket}/scripts/clean_orders_job.py
       DefaultArguments:
-        --DATABASE: canteen_db
+        --DATABASE: !Ref CanteenDatabase
         --SOURCE_TABLE: orders
         --TARGET_PATH: !Sub s3://${DataBucket}/processed/orders_clean/
         --TARGET_TABLE: orders_clean
@@ -167,7 +176,7 @@ Resources:
   AthenaWorkGroup:
     Type: AWS::Athena::WorkGroup
     Properties:
-      Name: how-data-moves
+      Name: !Ref AWS::StackName
       Description: Workgroup for the How Data Moves on AWS demo
       RecursiveDeleteOption: true
       State: ENABLED
@@ -181,7 +190,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "A3 - Spot the mess (raw CSV)"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: |
         SELECT item, COUNT(*) AS times_seen
@@ -193,7 +202,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "B2 - What sells the most"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: |
         SELECT item, SUM(quantity) AS sold
@@ -206,7 +215,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "B3 - What makes the most money"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: |
         SELECT item, SUM(total_amount) AS revenue_inr
@@ -219,7 +228,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "B4 - UPI vs cash"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: |
         SELECT payment_mode, COUNT(*) AS orders,
@@ -232,7 +241,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "B5 - Rush hour"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: |
         SELECT order_hour, COUNT(*) AS orders
@@ -244,7 +253,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "C1 - Revenue from CSV (check Data scanned)"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: SELECT SUM(quantity * unit_price) AS revenue FROM orders;
 
@@ -252,7 +261,7 @@ Resources:
     Type: AWS::Athena::NamedQuery
     Properties:
       Name: "C2 - Revenue from Parquet (check Data scanned)"
-      Database: canteen_db
+      Database: !Ref CanteenDatabase
       WorkGroup: !Ref AthenaWorkGroup
       QueryString: SELECT SUM(total_amount) AS revenue FROM orders_clean;
 

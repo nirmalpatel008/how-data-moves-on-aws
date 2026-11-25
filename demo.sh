@@ -10,20 +10,27 @@
 #  Options (env vars):
 #    AUTO=1   don't wait for Enter between steps
 #    FAST=1   don't type commands out letter by letter
-#    AWS_REGION=ap-south-1 (default)   STACK=how-data-moves (default)
+#    AWS_REGION=ap-south-1 (default)   STACK=scd-canteen (default)
 #
-#  Built for AWS CloudShell: needs the AWS CLI, jq and awk (all preinstalled there).
+#  Runs in AWS CloudShell, or on your laptop (Git Bash on Windows) with the
+#  AWS CLI configured and jq installed.
 # ------------------------------------------------------------------
 set -euo pipefail
 
 REGION="${AWS_REGION:-ap-south-1}"
-STACK="${STACK:-how-data-moves}"
-WG="how-data-moves"
-DB="canteen_db"
-CRAWLER="canteen-raw-crawler"
-JOB="clean-canteen-orders"
+STACK="${STACK:-scd-canteen}"
+# resource names come from the stack outputs (see load_names)
+WG=""; DB=""; CRAWLER=""; JOB=""
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" AWS_PAGER=""
+
+# Windows (Git Bash): the AWS CLI and jq end lines with \r\n, which breaks IDs passed
+# from one command to the next. Strip the \r so the script works the same as in CloudShell.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) STRIP_CR=1 ;; esac
+if [ "${STRIP_CR:-0}" = "1" ]; then
+  aws() { command aws "$@" | tr -d '\r'; }
+  jq()  { command jq "$@" | tr -d '\r'; }
+fi
 
 # ---------- look and feel ----------
 B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'
@@ -110,8 +117,10 @@ job_state() { aws glue get-job-run --job-name "$JOB" --run-id "$RUN_ID" --query 
 
 run() {
   cd "$HERE"
-  BUCKET=$(out BucketName)
-  [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ] && { echo "${RD}Stack not found. Run ./demo.sh up first.${R}"; exit 1; }
+  command -v jq >/dev/null || { echo "${RD}jq is missing. On Windows: winget install jqlang.jq, then open a new Git Bash window.${R}"; exit 1; }
+  BUCKET=$(out BucketName 2>/dev/null || true)
+  if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then echo "${RD}Stack $STACK not found. Run ./demo.sh up first.${R}"; exit 1; fi
+  WG=$(out AthenaWorkGroup); DB=$(out GlueDatabase); CRAWLER=$(out CrawlerName); JOB=$(out GlueJobName)
 
   # 1 ---------------------------------------------------------
   banner 1 "Raw CSV files sitting in S3"
